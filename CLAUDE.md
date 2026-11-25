@@ -26,5 +26,10 @@ State and invariants only.
   agent for hosts `NO_PROXY` matches (names, domain suffixes, CIDRs).
 - No speed claim without a measurement on named hardware and network, in
   `docs/runs/`.
+- Measured (`docs/runs/2026-11-25-vast-r2-curl-vs-weights`, R2 → Vast, 55 GB
+  incl. one 26 GB file): `-j 32` filled a 5.4 Gb/s Japan host (0.72 GB/s vs
+  curl-per-file's 0.19-0.24, 2.8-3.7×); a Utah host capped every method at
+  ~0.2 GB/s. `-j 64` was slower than 32 (the watchdog cut 339 GETs on a full
+  link). Byte-identical to curl (SHA-256, 18 files).
 - Tests: `cargo test` (a local tiny_http server with ranges, failures,
   truncation, no ranges; resume; local trees; plans).
