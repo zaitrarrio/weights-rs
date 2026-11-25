@@ -266,8 +266,8 @@ fn an_interrupted_transfer_resumes_only_the_missing_ranges() {
     assert_eq!(st.moved_bytes, 7 * chunk as u64);
     assert_eq!(
         s.requests.load(Ordering::SeqCst),
-        7,
-        "one request per missing range"
+        8,
+        "one range probe, then one request per missing range"
     );
 }
 
@@ -393,4 +393,26 @@ fn a_trickling_get_is_cut_and_its_rest_fetched_again() {
     assert_eq!(std::fs::read(d.join("big.bin")).unwrap(), body);
     assert_eq!(s.slow_restarts, 0);
     assert!(t.elapsed().as_secs_f64() > 1.0, "{:?}", t.elapsed());
+}
+
+#[test]
+fn a_planned_size_on_a_server_without_ranges_reads_one_stream() {
+    let body = data(3 * 4096 + 7, 11);
+    let srv = serve(vec![("whole.bin", body.clone())], Mode::NoRanges);
+    let d = tmp("planned-noranges");
+    let plan = format!("{}/whole.bin {} out.bin\n", srv.url, body.len());
+    let items = plan_items(&plan, Some(&d)).unwrap();
+    fetch(&items, &opts(4096, 4)).unwrap();
+    assert_eq!(std::fs::read(d.join("out.bin")).unwrap(), body);
+}
+
+#[test]
+fn a_planned_size_that_disagrees_with_the_source_is_an_error() {
+    let body = data(3 * 4096, 12);
+    let srv = serve(vec![("f.bin", body.clone())], Mode::Ranges);
+    let d = tmp("planned-wrong");
+    let plan = format!("{}/f.bin {} out.bin\n", srv.url, body.len() + 1);
+    let items = plan_items(&plan, Some(&d)).unwrap();
+    let e = fetch(&items, &opts(4096, 4)).unwrap_err();
+    assert!(format!("{e:#}").contains("the plan says"), "{e:#}");
 }
