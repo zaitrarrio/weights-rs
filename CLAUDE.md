@@ -3,8 +3,10 @@
 State and invariants only.
 
 - One crate (`crates/weights`) and one CLI (`crates/weights-cli`, binary
-  `weights`). Consumers: h3-rs, fastwan-rs, fastvideo-rs (git dependency;
-  boot scripts download the static binary).
+  `weights`). Consumers: h3-rs and fastwan-rs (their Vast boots download
+  the static binary from the run's R2 folder). fastvideo-rs keeps its own
+  `scripts/gpu/r2-fetch.py` (per-part SHA-256 against a pinned manifest,
+  serving while the weights arrive), which this crate does not replace.
 - Every transfer is ranges over one shared worker pool; ranges are written
   in place (`pwrite`) into `DEST.part`, recorded in `DEST.part.done`, and the
   file is renamed when complete. A destination already at its size is
