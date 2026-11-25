@@ -1,0 +1,14 @@
+[package]
+name = "weights"
+description = "Parallel, resumable, ranged transfers of model weights: HTTP(S) (R2 / S3 presigned URLs, Hugging Face) and local copies"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1"
+ureq = { version = "2.12", default-features = false, features = ["tls", "native-certs"] }
+
+[dev-dependencies]
+tiny_http = "0.12"
