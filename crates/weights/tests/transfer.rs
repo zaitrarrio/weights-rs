@@ -29,6 +29,20 @@ enum Mode {
     NoRanges,
     /// Sends half of each range, then closes (a broken connection).
     Truncate,
+    /// The first GET that starts at this offset trickles at ~200 KB/s; every
+    /// other GET (the rest of that range included) is served at once.
+    Trickle(usize),
+}
+
+/// A body read in 4 KiB pieces 20 ms apart.
+struct Slow(std::io::Cursor<Vec<u8>>);
+
+impl std::io::Read for Slow {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let n = buf.len().min(4096);
+        self.0.read(&mut buf[..n])
+    }
 }
 
 struct Server {
@@ -45,6 +59,7 @@ fn serve(files: Vec<(&'static str, Vec<u8>)>, mode: Mode) -> Server {
         .into_iter()
         .map(|(n, d)| (format!("/{n}"), Arc::new(d)))
         .collect();
+    let trickled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     std::thread::spawn(move || {
         for req in server.incoming_requests() {
             let n = count.fetch_add(1, Ordering::SeqCst) + 1;
@@ -71,6 +86,27 @@ fn serve(files: Vec<(&'static str, Vec<u8>)>, mode: Mode) -> Server {
                     let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
                     let b = b.min(body.len() - 1);
                     let mut slice = body[a..=b].to_vec();
+                    if let Mode::Trickle(at) = mode
+                        && a == at
+                        && !trickled.swap(true, Ordering::SeqCst)
+                    {
+                        let header = format!("bytes {a}-{b}/{}", body.len());
+                        let len = slice.len();
+                        // Its own thread: the other GETs go on meanwhile.
+                        std::thread::spawn(move || {
+                            let resp = tiny_http::Response::new(
+                                tiny_http::StatusCode(206),
+                                vec![
+                                    tiny_http::Header::from_bytes("Content-Range", header).unwrap(),
+                                ],
+                                Slow(std::io::Cursor::new(slice)),
+                                Some(len),
+                                None,
+                            );
+                            let _ = req.respond(resp);
+                        });
+                        continue;
+                    }
                     if matches!(mode, Mode::Truncate) && slice.len() > 1 && n.is_multiple_of(2) {
                         // Promise the whole range, send half: the client sees a short body.
                         let full = slice.len();
@@ -114,6 +150,7 @@ fn opts(chunk: u64, jobs: usize) -> Options {
         retries: 6,
         progress_s: 0,
         read_timeout_s: 2,
+        slow_after_s: 0.0,
     }
 }
 
@@ -321,4 +358,39 @@ fn errors_never_carry_a_presigned_signature() {
     }];
     let e = format!("{:#}", fetch(&items, &opts(1 << 20, 2)).unwrap_err());
     assert!(e.contains("404") && !e.contains("topsecret"), "{e}");
+}
+
+#[test]
+fn a_trickling_get_is_cut_and_its_rest_fetched_again() {
+    let chunk = 256 << 10;
+    let body = data(16 * chunk, 9);
+    // Range 12 trickles: 256 KiB at ~200 KB/s would take ~1.3 s alone.
+    let srv = serve(vec![("big.bin", body.clone())], Mode::Trickle(12 * chunk));
+    let d = tmp("trickle");
+    let items = vec![Item {
+        src: Source::Url(format!("{}/big.bin?X-Amz-Signature=s", srv.url)),
+        dest: d.join("big.bin"),
+        size: None,
+    }];
+    let mut o = opts(chunk as u64, 4);
+    o.slow_after_s = 0.3;
+    let t = std::time::Instant::now();
+    let s = fetch(&items, &o).unwrap();
+    assert_eq!(std::fs::read(d.join("big.bin")).unwrap(), body);
+    assert_eq!(s.slow_restarts, 1, "{s:?}");
+    assert!(t.elapsed().as_secs_f64() < 1.0, "{:?}", t.elapsed());
+
+    // The same server with the watchdog off waits for the trickle.
+    let srv = serve(vec![("big.bin", body.clone())], Mode::Trickle(12 * chunk));
+    let d = tmp("trickle-off");
+    let items = vec![Item {
+        src: Source::Url(format!("{}/big.bin", srv.url)),
+        dest: d.join("big.bin"),
+        size: None,
+    }];
+    let t = std::time::Instant::now();
+    let s = fetch(&items, &opts(chunk as u64, 4)).unwrap();
+    assert_eq!(std::fs::read(d.join("big.bin")).unwrap(), body);
+    assert_eq!(s.slow_restarts, 0);
+    assert!(t.elapsed().as_secs_f64() > 1.0, "{:?}", t.elapsed());
 }

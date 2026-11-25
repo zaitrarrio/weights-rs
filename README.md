@@ -27,7 +27,12 @@ Options for every subcommand:
 - `-j` concurrent ranges (16);
 - `--chunk-mb` (64);
 - `--retries` per range (8);
-- `--read-timeout` seconds before a stalled range is retried (60);
+- `--read-timeout` seconds before a stalled range is retried (20);
+- `--slow-after` seconds before the straggler watchdog may cut a GET (4; 0
+  turns it off). A GET that has run at under 1 MB/s for 20 s, or longer than
+  3× the recent ranges' time at under a third of their median rate, is cut.
+  The part of its range not yet written is requested again on a new
+  connection. R2 now and then serves one GET at 1-3 MB/s for minutes.
 - `--progress` seconds between progress lines (10).
 
 On a fresh GPU box (no Rust toolchain), boot scripts download the prebuilt

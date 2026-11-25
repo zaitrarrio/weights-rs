@@ -68,6 +68,14 @@ pub struct Options {
     pub progress_s: u64,
     /// Seconds a connection may stall before the range is retried.
     pub read_timeout_s: u64,
+    /// Straggler watchdog (0: off). A ranged GET that has run this long and
+    /// at under 1 MB/s after 20 s, or over 3× the time the recent ranges took
+    /// at under a third of their median rate, is cut and its unwritten rest
+    /// requested again on a new connection (at most 4 cuts per range; cuts are
+    /// not retries). R2 now and then serves one GET at 1-3 MB/s for minutes;
+    /// fastvideo-rs's `r2-fetch.py` measured 0.16-0.42 GB/s without such a
+    /// watchdog and 1.2-1.6 GB/s with it.
+    pub slow_after_s: f64,
 }
 
 impl Default for Options {
@@ -77,7 +85,8 @@ impl Default for Options {
             chunk: 64 << 20,
             retries: 8,
             progress_s: 10,
-            read_timeout_s: 60,
+            read_timeout_s: 20,
+            slow_after_s: 4.0,
         }
     }
 }
@@ -94,6 +103,8 @@ pub struct Stats {
     /// Bytes moved by this call (resumed ranges excluded).
     pub moved_bytes: u64,
     pub seconds: f64,
+    /// GETs the straggler watchdog cut.
+    pub slow_restarts: u64,
 }
 
 impl Stats {
@@ -449,6 +460,7 @@ pub fn fetch(items: &[Item], opts: &Options) -> Result<Stats> {
     let files = Arc::new(files);
     let queue = Arc::new(Mutex::new(jobs));
     let moved = Arc::new(AtomicU64::new(0));
+    let pace = Arc::new(Pace::new(opts.slow_after_s));
     let failed: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let stop = Arc::new(AtomicBool::new(false));
     let reporter = (opts.progress_s > 0 && todo_bytes > 0).then(|| {
@@ -472,12 +484,13 @@ pub fn fetch(items: &[Item], opts: &Options) -> Result<Stats> {
     });
     let workers: Vec<_> = (0..opts.jobs.max(1))
         .map(|_| {
-            let (files, queue, moved, failed, agent) = (
+            let (files, queue, moved, failed, agent, pace) = (
                 files.clone(),
                 queue.clone(),
                 moved.clone(),
                 failed.clone(),
                 agent.clone(),
+                pace.clone(),
             );
             let retries = opts.retries.max(1);
             std::thread::spawn(move || {
@@ -492,7 +505,7 @@ pub fn fetch(items: &[Item], opts: &Options) -> Result<Stats> {
                     let mut attempt = 0;
                     let r = loop {
                         attempt += 1;
-                        match transfer(&agent, f, &job, &moved) {
+                        match transfer(&agent, f, &job, &moved, &pace) {
                             Ok(()) => break Ok(()),
                             Err(e) if attempt < retries => {
                                 eprintln!(
@@ -534,30 +547,107 @@ pub fn fetch(items: &[Item], opts: &Options) -> Result<Stats> {
         bail!("transfer failed: {e}");
     }
     stats.moved_bytes = moved.load(Ordering::SeqCst);
+    stats.slow_restarts = pace.cuts.load(Ordering::SeqCst);
     stats.seconds = t0.elapsed().as_secs_f64();
     Ok(stats)
 }
 
+/// Recent ranged GETs' rates, for the straggler watchdog.
+struct Pace {
+    slow_after: f64,
+    rates: Mutex<VecDeque<f64>>,
+    cuts: AtomicU64,
+}
+
+impl Pace {
+    fn new(slow_after: f64) -> Self {
+        Self {
+            slow_after,
+            rates: Mutex::new(VecDeque::new()),
+            cuts: AtomicU64::new(0),
+        }
+    }
+
+    /// A finished GET of `bytes` in `secs`.
+    fn record(&self, bytes: u64, secs: f64) {
+        if bytes < 1 << 16 || secs <= 0.0 {
+            return;
+        }
+        let mut r = self.rates.lock().unwrap();
+        r.push_back(bytes as f64 / secs);
+        if r.len() > 64 {
+            r.pop_front();
+        }
+    }
+
+    /// The median of the recent rates, once there are 8.
+    fn typical(&self) -> Option<f64> {
+        let mut r: Vec<f64> = self.rates.lock().unwrap().iter().copied().collect();
+        if r.len() < 8 {
+            return None;
+        }
+        r.sort_by(f64::total_cmp);
+        Some(r[r.len() / 2])
+    }
+
+    /// Why a GET of `size` bytes that moved `n` in `el` seconds should be cut.
+    fn verdict(&self, el: f64, n: u64, size: u64) -> Option<String> {
+        if self.slow_after <= 0.0 || el < self.slow_after {
+            return None;
+        }
+        let rate = n as f64 / el;
+        let typical = self.typical();
+        let slow = (el >= 20.0 && rate < 1e6)
+            || typical.is_some_and(|t| el > 3.0 * size as f64 / t && rate < t / 3.0);
+        slow.then(|| {
+            format!("{:.2} MB/s after {el:.1} s", rate / 1e6)
+                + &typical
+                    .map(|t| format!(" (recent ranges {:.0} MB/s)", t / 1e6))
+                    .unwrap_or_default()
+        })
+    }
+}
+
+/// How a read loop ended.
+enum Outcome {
+    Done,
+    Slow(String),
+}
+
 /// One range of one file, written at its offset; on a short read the error
 /// leaves the range unrecorded, so a retry or a later run fetches it again.
-fn transfer(agent: &Http, f: &FileState, job: &Job, moved: &AtomicU64) -> Result<()> {
+fn transfer(agent: &Http, f: &FileState, job: &Job, moved: &AtomicU64, pace: &Pace) -> Result<()> {
     let mut written = 0u64;
     let mut buf = vec![0u8; 1 << 20];
-    let mut put = |r: &mut dyn Read, written: &mut u64| -> Result<()> {
+    // Reads until the range is complete; `check(bytes this call, seconds)`
+    // may stop it early.
+    let mut put = |r: &mut dyn Read,
+                   written: &mut u64,
+                   check: &mut dyn FnMut(u64, f64) -> Option<String>|
+     -> Result<Outcome> {
+        let (t, from) = (Instant::now(), *written);
+        let mut last_check = 0.0f64;
         while *written < job.len {
             let want = (job.len - *written).min(buf.len() as u64) as usize;
             let n = r.read(&mut buf[..want])?;
             if n == 0 {
                 if job.len == u64::MAX {
-                    return Ok(());
+                    return Ok(Outcome::Done);
                 }
                 bail!("short read: {} of {} bytes", *written, job.len);
             }
             f.file.write_all_at(&buf[..n], job.offset + *written)?;
             *written += n as u64;
             moved.fetch_add(n as u64, Ordering::Relaxed);
+            let el = t.elapsed().as_secs_f64();
+            if el - last_check >= 0.25 {
+                last_check = el;
+                if let Some(why) = check(*written - from, el) {
+                    return Ok(Outcome::Slow(why));
+                }
+            }
         }
-        Ok(())
+        Ok(Outcome::Done)
     };
     let r = match &f.item.src {
         Source::Path(p) => {
@@ -568,20 +658,59 @@ fn transfer(agent: &Http, f: &FileState, job: &Job, moved: &AtomicU64) -> Result
                     pos: job.offset,
                 },
                 &mut written,
+                &mut |_, _| None,
             )
+            .map(|_| ())
         }
         Source::Url(u) => {
-            let range = (f.ranges && f.size > 0 && f.size != u64::MAX)
-                .then(|| (job.offset, job.offset + job.len - 1));
-            let resp = agent.get(u, range)?;
-            if f.ranges
-                && f.size > 0
-                && resp.status() != 206
-                && !(job.offset == 0 && job.len == f.size)
-            {
-                bail!("GET {}: status {} for a range", redact(u), resp.status());
+            let ranged = f.ranges && f.size > 0 && f.size != u64::MAX;
+            let mut cuts = 0u32;
+            loop {
+                let (start, rest) = (job.offset + written, job.len - written);
+                let range = ranged.then(|| (start, job.offset + job.len - 1));
+                let t = Instant::now();
+                let resp = match agent.get(u, range) {
+                    Ok(r) => r,
+                    Err(e) => break Err(e),
+                };
+                if f.ranges && f.size > 0 && resp.status() != 206 && !(start == 0 && rest == f.size)
+                {
+                    break Err(anyhow::anyhow!(
+                        "GET {}: status {} for a range",
+                        redact(u),
+                        resp.status()
+                    ));
+                }
+                let watch = ranged && cuts < 4;
+                let mut check = |n: u64, el: f64| {
+                    if watch {
+                        pace.verdict(el, n, rest)
+                    } else {
+                        None
+                    }
+                };
+                match put(&mut resp.into_reader(), &mut written, &mut check) {
+                    Ok(Outcome::Done) => {
+                        pace.record(rest, t.elapsed().as_secs_f64());
+                        break Ok(());
+                    }
+                    Ok(Outcome::Slow(why)) => {
+                        // Dropping the reader closes the connection; the rest
+                        // of the range goes out on a fresh one.
+                        cuts += 1;
+                        pace.cuts.fetch_add(1, Ordering::Relaxed);
+                        eprintln!(
+                            "weights: {} range {}: cut a slow GET ({why}), {} of {} bytes in; \
+                             fetching the rest again",
+                            f.item.dest.display(),
+                            job.index,
+                            written,
+                            job.len
+                        );
+                    }
+                    Err(e) => break Err(e),
+                }
             }
-            put(&mut resp.into_reader(), &mut written)
         }
     };
     if r.is_err() {

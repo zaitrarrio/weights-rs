@@ -9,6 +9,11 @@ State and invariants only.
   in place (`pwrite`) into `DEST.part`, recorded in `DEST.part.done`, and the
   file is renamed when complete. A destination already at its size is
   skipped. Keep a rerun's cost to the missing ranges.
+- Straggler watchdog (`Pace`, `--slow-after`): a slow GET is cut and the
+  unwritten rest of its range is requested again, at most 4 cuts per range.
+  Cuts are not retries. The rule is fastvideo-rs's `r2-fetch.py` one
+  (`docs/ops/r2-weights.md` there: 0.16-0.42 → 1.2-1.6 GB/s on R2).
+  `a_trickling_get_is_cut_and_its_rest_fetched_again` holds it.
 - Presigned GETs cannot be HEADed: sizes come from a `Range: bytes=0-0` GET
   (`Content-Range` total). A server that ignores ranges is read in one
   stream; with no `Content-Length`, to its end.

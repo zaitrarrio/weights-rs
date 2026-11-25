@@ -43,8 +43,12 @@ struct Opts {
     #[arg(long, default_value_t = 10, global = true)]
     progress: u64,
     /// Seconds a connection may stall before its range is retried.
-    #[arg(long, default_value_t = 60, global = true)]
+    #[arg(long, default_value_t = 20, global = true)]
     read_timeout: u64,
+    /// Straggler watchdog: a GET running this many seconds far behind the
+    /// recent ranges' pace is cut and its rest fetched again (0: off).
+    #[arg(long, default_value_t = 4.0, global = true)]
+    slow_after: f64,
 }
 
 #[derive(Subcommand)]
@@ -83,6 +87,7 @@ fn main() -> Result<()> {
         retries: cli.opts.retries,
         progress_s: cli.opts.progress,
         read_timeout_s: cli.opts.read_timeout,
+        slow_after_s: cli.opts.slow_after,
     };
     let items: Vec<Item> = match cli.cmd {
         Cmd::Get { src, dest, size } => vec![Item {
@@ -95,13 +100,18 @@ fn main() -> Result<()> {
     };
     let s: Stats = weights::fetch(&items, &opts)?;
     eprintln!(
-        "weights: {} files ({} already complete), {:.2} GB moved of {:.2} GB in {:.1} s ({:.2} GB/s)",
+        "weights: {} files ({} already complete), {:.2} GB moved of {:.2} GB in {:.1} s ({:.2} GB/s){}",
         s.files,
         s.skipped,
         s.moved_bytes as f64 / 1e9,
         s.total_bytes as f64 / 1e9,
         s.seconds,
-        s.rate_gbps()
+        s.rate_gbps(),
+        if s.slow_restarts > 0 {
+            format!(", {} slow GETs cut", s.slow_restarts)
+        } else {
+            String::new()
+        }
     );
     Ok(())
 }
