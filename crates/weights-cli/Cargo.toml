@@ -1,0 +1,16 @@
+[package]
+name = "weights-cli"
+description = "`weights`: parallel ranged downloads and copies of model weight trees"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "weights"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+weights = { path = "../weights" }
