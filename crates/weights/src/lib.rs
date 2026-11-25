@@ -323,6 +323,56 @@ pub fn probe_size(http: &Http, src: &Source) -> Result<(Option<u64>, bool)> {
     }
 }
 
+/// A probe's answer: the size, if the source told it, and whether it serves ranges.
+type Probe = (Option<u64>, bool);
+
+/// The size probes a plan needs, run `jobs` at a time: every item without a
+/// size, and every URL of more than one range that is not already at its
+/// destination (a server that ignores `Range` answers each range with the
+/// whole body, so such a file must be read as one stream). `None`: no probe.
+fn probe_all(http: &Http, items: &[Item], chunk: u64, jobs: usize) -> Result<Vec<Option<Probe>>> {
+    let need: Vec<usize> = (0..items.len())
+        .filter(|&i| {
+            let it = &items[i];
+            match it.size {
+                None => true,
+                Some(s) => {
+                    matches!(it.src, Source::Url(_))
+                        && s > chunk
+                        && !std::fs::metadata(&it.dest).is_ok_and(|m| m.is_file() && m.len() == s)
+                }
+            }
+        })
+        .collect();
+    let out: Vec<Mutex<Option<Probe>>> = (0..items.len()).map(|_| Mutex::new(None)).collect();
+    let next = AtomicU64::new(0);
+    let err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    std::thread::scope(|sc| {
+        for _ in 0..jobs.clamp(1, 32).min(need.len()) {
+            sc.spawn(|| {
+                loop {
+                    let k = next.fetch_add(1, Ordering::SeqCst) as usize;
+                    let Some(&i) = need.get(k) else { return };
+                    if err.lock().unwrap().is_some() {
+                        return;
+                    }
+                    match probe_size(http, &items[i].src) {
+                        Ok(p) => *out[i].lock().unwrap() = Some(p),
+                        Err(e) => {
+                            err.lock().unwrap().get_or_insert(e);
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    if let Some(e) = err.into_inner().unwrap() {
+        return Err(e);
+    }
+    Ok(out.into_iter().map(|m| m.into_inner().unwrap()).collect())
+}
+
 /// A URL without its query string (presigned signatures stay out of logs).
 pub fn redact(u: &str) -> &str {
     u.split('?').next().unwrap_or(u)
@@ -371,10 +421,17 @@ pub fn fetch(items: &[Item], opts: &Options) -> Result<Stats> {
     let mut files: Vec<FileState> = Vec::new();
     let mut jobs: VecDeque<Job> = VecDeque::new();
     let mut todo_bytes = 0u64;
-    for item in items {
-        let (size, ranges) = match item.size {
-            Some(s) => (Some(s), true),
-            None => probe_size(&agent, &item.src)?,
+    let probes = probe_all(&agent, items, chunk, opts.jobs)?;
+    for (item, probe) in items.iter().zip(probes) {
+        let (size, ranges) = match (item.size, probe) {
+            (Some(s), None) => (Some(s), true),
+            (Some(s), Some((Some(p), _))) if p != s => bail!(
+                "{}: the plan says {s} bytes, the source has {p}",
+                item.dest.display()
+            ),
+            (Some(s), Some((_, r))) => (Some(s), r),
+            (None, Some(p)) => p,
+            (None, None) => unreachable!("probe_all probes every item without a size"),
         };
         stats.total_bytes += size.unwrap_or(0);
         let size = size.unwrap_or(u64::MAX);
