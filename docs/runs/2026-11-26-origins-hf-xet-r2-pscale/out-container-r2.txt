@@ -1,0 +1,32 @@
+== host
+4
+               total        used        free      shared  buff/cache   available
+Mem:              15           0          12           0           3          15
+/dev/vda        252G   26G   44G  37% /
+curl 8.5.0 (x86_64-pc-linux-gnu) libcurl/8.5.0 OpenSSL/3.0.13 zlib/1.3 brotli/1.1.0 zstd/1.5.5 libidn2/2.3.7 libpsl/0.21.2 (+libidn2/2.3.7) libssh/0.10.6/openssl/zlib nghttp2/1.59.0 librtmp/2.3 OpenLDAP/2.6.10
+weights 0.1.0
+version=2.4.0
+== workload: Qwen/Qwen2.5-1.5B @ main
+expecting 3098972223 bytes
+== ceilings
+4294967296 bytes (4.3 GB, 4.0 GiB) copied, 4.4615 s, 963 MB/s
+sha256 1 core: 3.30 s for 4.29 GB = 1303 MB/s
+== round 1: hfw r2w r2curl8 pscaler2
+RESULT hfw-1          rc=0     10.4 s     3.10 GB  0.299 GB/s
+RESULT r2w-1          rc=0     13.6 s     3.10 GB  0.227 GB/s
+RESULT r2curl8-1      rc=0    116.9 s     3.10 GB  0.027 GB/s
+RESULT pscaler2-1     rc=0    152.9 s     3.10 GB  0.020 GB/s
+== round 2: pscaler2 r2curl8 r2w hfw 
+RESULT pscaler2-2     rc=0     81.0 s     3.10 GB  0.038 GB/s
+RESULT r2curl8-2      rc=0    177.6 s     3.10 GB  0.017 GB/s
+RESULT r2w-2          rc=0      9.0 s     3.10 GB  0.346 GB/s
+RESULT hfw-2          rc=0     10.6 s     3.10 GB  0.293 GB/s
+== byte-identity across arms
+reference: hfw-1 (10 files)
+  OK    hfw-2
+  OK    pscaler2-1
+  OK    pscaler2-2
+  OK    r2curl8-1
+  OK    r2curl8-2
+  OK    r2w-1
+  OK    r2w-2
