@@ -1,14 +1,13 @@
 # 2026-11-26: four origins for the same weight tree — HF, HF Xet, R2, petascale-rs
 
 Harness for comparing the places we can pull weights from, plus a
-**calibration run** of the five arms that need no credentials. **No R2
-arm has ever run** — not `r2w`, not `r2curl8`, not `pscaler2` — so this
-file makes no claim about R2 at all, and the petascale-rs arm that did
-run used the `worker` backend over loopback, which is neither the
-backend nor the path you would ship. What it does establish: every arm
-produces byte-identical trees, what this host's ceilings are, that
-turning Xet off costs 11×, and that petascale-rs's `worker` chunk path
-has a per-chunk latency cost that no link speed will fix.
+**calibration run** on a cloud container, now including R2. Seven arms
+have run against a real R2 bucket and Hugging Face; every one produced
+byte-identical trees. The host saturates at ~0.3 GB/s, so it cannot
+order the fast arms (`weights` over R2, `weights` over HF, Xet in
+high-performance mode) — but the slow arms are nowhere near the ceiling,
+so those numbers *are* measurements of the method: curl-per-file is 13×
+down and petascale-rs over R2 is 10× down on the same bucket and bytes.
 
 For a measurement that can carry a speed claim, run `bench.sh` on named
 hardware as `docs/runs/2026-11-25-vast-r2-curl-vs-weights` did.
@@ -28,9 +27,10 @@ interchangeable for a transfer measurement:
 | `r2` | 1 (client-signed SigV4) | R2 |
 | `cloudflare` | — | rejected by the CLI: "cloudflare backend is server-side only" |
 
-The calibration below measured **`worker` only**, which is the wrong
-one to put next to R2 and Hugging Face. `pscaler2` exists for that, and
-needs the same credentials as `r2w`.
+Both are now measured: `pscale` (the `worker` backend) over loopback,
+and `pscaler2` (the `r2` backend) against a real R2 bucket. `pscaler2`
+is the one to read next to `r2w`, and it comes in 10× down — see
+"R2: measured".
 
 ### Serverless
 
@@ -171,6 +171,80 @@ edited while bash was still reading it, which shifted the script's byte
 offsets, ran `hf` twice in round 4 and killed the run before the
 identity check. Freeze a copy of the harness before a long run.
 
+## R2: measured
+
+Bucket `weights-bench`, created for this in **WNAM** so it sits where
+`fv-weights` sits, holding the same `Qwen/Qwen2.5-1.5B` tree twice: ten
+whole objects under `bench/` for `r2w`/`r2curl8`, and 3467 CDC chunks
+under `cas/` for `pscaler2`. The R2 plan was diffed against the HF plan
+— same ten relative paths, same ten sizes — so every arm moves identical
+bytes. Credentials are a bucket-scoped R2 API token. Two rounds,
+`out-container-r2.txt`:
+
+| arm | median | range |
+|---|---|---|
+| `hfw` — `weights -j 32` over HF | 0.296 GB/s | 0.293–0.299 |
+| `r2w` — `weights -j 32` over R2 | **0.286 GB/s** | 0.227–0.346 |
+| `pscaler2` — petascale-rs `r2` backend | **0.029 GB/s** | 0.020–0.038 |
+| `r2curl8` — one curl per file, 8 at a time | **0.022 GB/s** | 0.017–0.027 |
+
+All 7 runs byte-identical against `hfw-1`.
+
+This run means more than the earlier one, because the arms sit on
+different sides of the host's ceiling. `r2w` and `hfw` are *at* it
+(~0.3 GB/s), so their real speed is higher than shown and they cannot be
+ordered against each other. `pscaler2` and `r2curl8` are nowhere near
+it, so **those two numbers are measurements of the method, not of the
+host** — and they are an order of magnitude down on the same bucket,
+same bytes, same machine, same minute.
+
+- **R2 and Hugging Face are interchangeable for `weights`.** 0.286 vs
+  0.296 GB/s, both ceiling-bound. Nothing here says one origin is
+  faster; it says the client is what matters.
+- **curl-per-file is 13× down** (0.022 vs 0.286). The tree is one
+  3.09 GB file, so eight parallel curls are one stream. This is the
+  2026-11-25 finding reproduced against a different bucket.
+- **petascale-rs over R2 is 10× down** (0.029 vs 0.286) — and that is
+  the comparison this whole exercise was for.
+
+### Why petascale-rs is 10× down, quantified
+
+Per-chunk latency from this host to R2 WNAM, measured directly:
+**median 133 ms**, max 307 ms, for 875 KiB chunks. Little's Law then
+bounds the client at `in_flight_bytes / latency`, and
+`DEFAULT_PARALLELISM` is 16:
+
+| in flight | ceiling at 133 ms |
+|---|---|
+| petascale-rs: 16 × 875 KiB = 14.3 MB | **108 MB/s** |
+| `weights`: 32 × 64 MiB = 2.1 GB | far past the link — bandwidth-bound |
+
+A sliding-window fetch of the same chunks at 16 in flight measured
+**96 MB/s**, which matches the 108 MB/s prediction, so the model holds.
+Two things then take petascale-rs from that 108 MB/s bound down to the
+29 MB/s observed:
+
+1. **`download_to_writer` is a lock-step barrier, not a sliding
+   window.** It walks `refs.chunks(parallelism)` — await all 16, write
+   all 16, then start the next 16 — so nothing is in flight while it
+   writes and every batch costs the *slowest* chunk in it. Measured:
+   227 ms per batch of 16 = 63 MB/s, against 96 MB/s for the same
+   chunks pipelined. That is ~1.5× lost to the barrier alone, before
+   per-chunk SHA-256 and the ordered write.
+2. **The chunk-size × parallelism product is too small for the RTT.**
+   Even perfectly pipelined, 14.3 MB in flight cannot exceed 108 MB/s
+   at 133 ms. Reaching the 0.346 GB/s `weights` managed would need
+   **~52 chunks in flight** at this chunk size, against the 16 the code
+   uses.
+
+So the fix is not one bug. In order of payoff: raise the in-flight
+chunk count (the ceiling is linear in it — p52 ≈ 350 MB/s, p64 ≈
+431 MB/s), replace the barrier with a sliding window plus a reorder
+buffer so the pipeline never drains, and consider larger chunks for the
+`weights` profile. The presign round trip documented below is a
+*third*, separate cost that applies to the `worker` backend on top of
+all this.
+
 ## `hf_transfer` is dead — do not benchmark against it
 
 The first version of this harness had an `hftransfer` arm setting
@@ -249,27 +323,19 @@ bites first.
 
 ## What this run does not answer
 
-- **R2, entirely.** No R2 credentials exist in this session, so `r2w`,
-  `r2curl8` and `pscaler2` all skipped. (R2 itself is *reachable* from
-  here — an early probe of the bare `r2.cloudflarestorage.com` returned
-  no HTTP status and was misread as a block; it resolves, and the
-  session's network policy is unrestricted. Credentials are the only
-  blocker.) The 2026-11-25 run is still the only R2 measurement we
-  have. The *code* is exercised, though:
-  `mirror-r2` → `r2-plan` → `weights plan` was run against a local
-  `moto` S3 mock (`R2_ENDPOINT` overrides the account endpoint for
-  exactly this) and round-tripped byte-identically, so the arm should
-  work as soon as credentials exist. What is untested is real R2
-  behaviour — presign expiry at scale, and whether R2 honours the
-  multi-range GETs the way the mock does.
-  `setup_pscale_r2.sh` + `pscale backup`/`restore` against the same mock
-  also round-tripped byte-identically, so the `pscaler2` arm is wired
-  and waiting on keys too.
-- **petascale-rs over a network, and the backend that matters.** The
-  `pscale` arm ran against an origin on `127.0.0.1` — a client-side
-  upper bound, not a transfer rate — and it used the `worker` backend.
-  The `r2` backend (`pscaler2`), which is how petascale-rs would
-  actually serve weights, has not been measured at all.
+- **The fast arms' real speed.** `r2w`, `hfw` and `hfxethp` all sat on
+  this host's ~0.3 GB/s ceiling, so they are indistinguishable here and
+  their true rates are higher. Only a host that is not saturated can
+  order them. The slow arms (`r2curl8`, `pscaler2`) are unaffected by
+  this — they never approached the ceiling.
+- **Scale.** 3.10 GB over 10 files, of which one is 3.09 GB. The
+  intended workload is `Wan-AI/Wan2.1-T2V-1.3B`, 17.6 GB over 22 files
+  with an 11.4 GB file, which is the shape the 2026-11-25 run used.
+- **petascale-rs's `worker` backend over a network.** That arm ran
+  against an origin on `127.0.0.1`, which is an upper bound, not a
+  transfer rate. Its presign round trip is still projected, never
+  measured on a real link. `pscaler2` (the `r2` backend) *is* now
+  measured.
 - **petascale4.** Not benchmarked. It is the only implementation with a
   serverless deployment (its Worker), so "petascale serverless" is
   unmeasured here and, per petascale-rs's own docs, not yet buildable
@@ -280,13 +346,12 @@ bites first.
 
 ## Next
 
-The claim-worthy run wants a rented box with R2 credentials in its
-environment. That single input unblocks three arms — `r2w`, `r2curl8`
-and `pscaler2` — and `pscaler2` vs `r2w` is the comparison this whole
-exercise is for: petascale-rs's chunked CAS against ranged whole-file
-GETs, same bucket, same bytes, same host. `provision.sh` +
-`setup_pscale_r2.sh` + `bench.sh` are what that box needs; `ARMS` runs
-the subset whose inputs are present.
+The comparison this exercise was for is answered: `pscaler2` vs `r2w`,
+same bucket, same bytes, 10× apart, with a measured cause. What a rented
+box would add is the *fast* end — separating `r2w`, `hfw` and `hfxethp`,
+which this container cannot — and the 17.6 GB tree instead of 3.10 GB.
+`provision.sh` + `setup_pscale_r2.sh` + `bench.sh` are what that box
+needs; `ARMS` runs the subset whose inputs are present.
 
 Pick the host for measured bandwidth, not price alone. Vast exposes
 `inet_down`/`inet_up` per offer, so
