@@ -1,35 +1,58 @@
 == host
 4
                total        used        free      shared  buff/cache   available
-Mem:              15           0           9           0           6          15
-/dev/vda        252G   22G   47G  32% /
+Mem:              15           0          14           0           0          14
+/dev/vda        252G   26G   44G  37% /
 curl 8.5.0 (x86_64-pc-linux-gnu) libcurl/8.5.0 OpenSSL/3.0.13 zlib/1.3 brotli/1.1.0 zstd/1.5.5 libidn2/2.3.7 libpsl/0.21.2 (+libidn2/2.3.7) libssh/0.10.6/openssl/zlib nghttp2/1.59.0 librtmp/2.3 OpenLDAP/2.6.10
 weights 0.1.0
 version=2.4.0
 == workload: Qwen/Qwen2.5-1.5B @ main
 expecting 3098972223 bytes
 == ceilings
-4294967296 bytes (4.3 GB, 4.0 GiB) copied, 5.67956 s, 756 MB/s
-sha256 1 core: 3.55 s for 4.29 GB = 1211 MB/s
-== round 1: hf hftransfer hfxet hfw pscale
-RESULT hf-1           rc=0    115.3 s     3.10 GB  0.027 GB/s
-RESULT hftransfer-1   rc=0    116.0 s     3.10 GB  0.027 GB/s
-RESULT hfxet-1        rc=0     16.1 s     3.10 GB  0.192 GB/s
+4294967296 bytes (4.3 GB, 4.0 GiB) copied, 4.89647 s, 877 MB/s
+sha256 1 core: 3.49 s for 4.29 GB = 1232 MB/s
+== round 1: hf hfxet hfxethp hfw pscale
+RESULT hf-1           rc=0    113.1 s     3.10 GB  0.027 GB/s
+RESULT hfxet-1        rc=0     16.4 s     3.10 GB  0.189 GB/s
+RESULT hfxethp-1      rc=0      9.9 s     3.10 GB  0.312 GB/s
 RESULT hfw-1          rc=0     10.5 s     3.10 GB  0.294 GB/s
-RESULT pscale-1       rc=0     10.9 s     3.10 GB  0.284 GB/s
-== round 2: pscale hfw hfxet hftransfer hf 
-RESULT pscale-2       rc=0     10.5 s     3.10 GB  0.294 GB/s
-RESULT hfw-2          rc=0     17.9 s     3.10 GB  0.173 GB/s
-RESULT hfxet-2        rc=0     18.0 s     3.10 GB  0.172 GB/s
-RESULT hftransfer-2   rc=0    166.6 s     3.10 GB  0.019 GB/s
-RESULT hf-2           rc=0    114.1 s     3.10 GB  0.027 GB/s
-== round 3: hf hftransfer hfxet hfw pscale
-RESULT hf-3           rc=0    115.9 s     3.10 GB  0.027 GB/s
-RESULT hftransfer-3   rc=0    113.0 s     3.10 GB  0.027 GB/s
-RESULT hfxet-3        rc=0     14.2 s     3.10 GB  0.218 GB/s
-RESULT hfw-3          rc=0      9.5 s     3.10 GB  0.325 GB/s
-RESULT pscale-3       rc=0     10.4 s     3.10 GB  0.298 GB/s
-== round 4: pscale hfw hfxet hftransfer hf 
-RESULT pscale-4       rc=0     10.6 s     3.10 GB  0.294 GB/s
-RESULT hfw-4          rc=0      9.5 s     3.10 GB  0.327 GB/s
-RESULT hfxet-4        rc=0     14.0 s     3.10 GB  0.221 GB/s
+RESULT pscale-1       rc=0     10.3 s     3.10 GB  0.302 GB/s
+== round 2: pscale hfw hfxethp hfxet hf 
+RESULT pscale-2       rc=0     10.0 s     3.10 GB  0.310 GB/s
+RESULT hfw-2          rc=0     10.3 s     3.10 GB  0.301 GB/s
+RESULT hfxethp-2      rc=0     10.0 s     3.10 GB  0.311 GB/s
+RESULT hfxet-2        rc=0     15.0 s     3.10 GB  0.206 GB/s
+RESULT hf-2           rc=0    111.9 s     3.10 GB  0.028 GB/s
+== round 3: hf hfxet hfxethp hfw pscale
+RESULT hf-3           rc=0    115.5 s     3.10 GB  0.027 GB/s
+RESULT hfxet-3        rc=0     15.1 s     3.10 GB  0.206 GB/s
+RESULT hfxethp-3      rc=0      9.6 s     3.10 GB  0.323 GB/s
+RESULT hfw-3          rc=0     10.1 s     3.10 GB  0.305 GB/s
+RESULT pscale-3       rc=0     10.0 s     3.10 GB  0.311 GB/s
+== round 4: pscale hfw hfxethp hfxet hf 
+RESULT pscale-4       rc=0     10.0 s     3.10 GB  0.311 GB/s
+RESULT hfw-4          rc=0      9.9 s     3.10 GB  0.313 GB/s
+RESULT hfxethp-4      rc=0     10.4 s     3.10 GB  0.298 GB/s
+RESULT hfxet-4        rc=0     13.7 s     3.10 GB  0.226 GB/s
+RESULT hf-4           rc=0    158.1 s     3.10 GB  0.020 GB/s
+== byte-identity across arms
+reference: hf-1 (10 files)
+  OK    hf-2
+  OK    hf-3
+  OK    hf-4
+  OK    hfw-1
+  OK    hfw-2
+  OK    hfw-3
+  OK    hfw-4
+  OK    hfxet-1
+  OK    hfxet-2
+  OK    hfxet-3
+  OK    hfxet-4
+  OK    hfxethp-1
+  OK    hfxethp-2
+  OK    hfxethp-3
+  OK    hfxethp-4
+  OK    pscale-1
+  OK    pscale-2
+  OK    pscale-3
+  OK    pscale-4

@@ -17,8 +17,9 @@ set -u
 : "${HFJ:=16}"            # hf download --max-workers
 : "${W:=weights}"         # the weights binary
 : "${PSCALE:=pscale}"
+: "${PSCALE_SNAPSHOT_R2:=${PSCALE_SNAPSHOT:-}}"
 : "${HF:=hf}"
-: "${ARMS:=hf hfxet hfxethp hfw r2w r2curl8 pscale}"
+: "${ARMS:=hf hfxet hfxethp hfw r2w r2curl8 pscale pscaler2}"
 : "${ROUNDS:=2}"
 mkdir -p "$RES"
 
@@ -64,8 +65,14 @@ arm_r2w()     { awk -v d="$D" '{print $1, $2, d "/" $3}' "$PLAN_R2" > "$RES/wpla
 # The old boot, kept for continuity with 2026-11-25: one curl per file, 8 at a time.
 arm_r2curl8() { awk -v d="$D" '{print $1, d "/" $3}' "$PLAN_R2" \
                 | xargs -P 8 -n 2 sh -c 'mkdir -p "$(dirname "$1")" && curl -sf --retry 5 -o "$1" "$0" || echo "FAILED $1"'; }
-# petascale-rs: restore a snapshot out of a chunk store over HTTP.
+# petascale-rs, `worker` backend: restore out of a petascale server. Two
+# requests per chunk (presign, then GET), both to the server.
 arm_pscale()  { $PSCALE restore "$PSCALE_SNAPSHOT" --namespace "${PSCALE_NS:-bench}" --dest "$D"; }
+# petascale-rs, `r2` backend: the client signs SigV4 itself and GETs each
+# chunk straight from R2 (R2Store::get is one request, no presign hop), so
+# the bytes come off R2's edge. THIS is the arm comparable to r2w, and the
+# one that matches how petascale-rs is meant to serve weights.
+arm_pscaler2() { $PSCALE restore "$PSCALE_SNAPSHOT_R2" --namespace "$PSCALE_NS_R2" --dest "$D"; }
 
 # Both Xet and petascale keep a local chunk cache. A warm cache turns the
 # second round into a disk read, so every run starts with them empty.
@@ -75,8 +82,9 @@ cold() {
   sync; return 0
 }
 
-export -f arm_hf arm_hfxethp arm_hfxet arm_hfw arm_r2w arm_r2curl8 arm_pscale
+export -f arm_hf arm_hfxethp arm_hfxet arm_hfw arm_r2w arm_r2curl8 arm_pscale arm_pscaler2
 export REPO REV D RES J HFJ W PSCALE HF PLAN_HF PLAN_R2 PSCALE_SNAPSHOT PSCALE_NS
+export PSCALE_SNAPSHOT_R2 PSCALE_NS_R2
 
 # ---- harness ----------------------------------------------------------
 # hf download leaves its own bookkeeping dir; it is not part of the tree.
@@ -110,6 +118,7 @@ for r in $(seq 1 "$ROUNDS"); do
     [ "$a" = hfw ] && [ -z "${PLAN_HF:-}" ] && { echo "skip hfw: no PLAN_HF"; continue; }
     case "$a" in r2w|r2curl8) [ -z "${PLAN_R2:-}" ] && { echo "skip $a: no PLAN_R2"; continue; } ;; esac
     [ "$a" = pscale ] && [ -z "${PSCALE_SNAPSHOT:-}" ] && { echo "skip pscale: no PSCALE_SNAPSHOT"; continue; }
+    [ "$a" = pscaler2 ] && [ -z "${PSCALE_NS_R2:-}" ] && { echo "skip pscaler2: no PSCALE_NS_R2"; continue; }
     run "$a-$r" "arm_$a"
   done
 done
