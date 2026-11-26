@@ -361,17 +361,35 @@ offers with ≥3 Gb/s down and ≥150 GB disk started at $0.082/h. This
 container could not order its top three arms at all — they all sat on
 its ~0.31 GB/s ceiling.
 
-One practical note for RunPod, which was tried first and abandoned: pods deployed from `runpod-ubuntu-2404`
-(and the bare `runpod/base:1.0.2-ubuntu2404` image) with `PUBLIC_KEY` in
-`env` came up `RUNNING` with 22/tcp mapped but nothing listening, on
-three separate machines across both community and secure cloud.
-Overriding `dockerArgs` to start `sshd` by hand instead crashlooped the
-container, since it replaces the image's own entrypoint. The pod's HTTP
-proxy (`https://<podId>-<port>.proxy.runpod.net`) *is* reachable and
-answers 404 when nothing is bound, so an unattended run that serves
-`$RES` over that proxy is the fallback that needs no SSH at all. The
-root cause is that RunPod's official images build `authorized_keys` from
-the *account's* SSH key setting, whose API field is single-valued — so
-automating it would overwrite the operator's own key. Vast takes several
-account keys and also honours a key injected by `onstart`, which needs
-no account change.
+### Driving a rented box from a restricted container
+
+Both attempts to rent a bench box failed for one reason, and it took far
+too long to find: **this container can only open outbound TCP on port
+443.** `github.com:22` is refused while `ssh.github.com:443` connects.
+Every SSH endpoint on offer is a high port — RunPod mapped 22 to 22025 /
+22173 / 22022, Vast's proxy gave 24490 and 10508 — so all of them were
+refused at the TCP layer, before any key was ever offered.
+
+Test this first, before renting anything:
+
+```sh
+timeout 15 bash -c 'cat < /dev/null > /dev/tcp/github.com/22' \
+  && echo "port 22 reachable" || echo "non-443 egress blocked"
+```
+
+Two earlier explanations recorded here were wrong, and are retracted:
+that RunPod's images build `authorized_keys` from a single-valued
+account SSH key field (so the pods were unreachable), and that two Vast
+machines had broken tunnels. The account-key detail may well be true of
+RunPod in general, but it was not why those pods were unreachable, and
+the Vast machines were almost certainly fine. The cause was local in
+every case.
+
+What does work from here, all on 443: the provider REST APIs, R2 and the
+Hugging Face CDN, and RunPod's `https://<podId>-<port>.proxy.runpod.net`
+(it answers 404 when nothing is bound). So a bench box has to be driven
+without an interactive shell — an unattended `onstart` that runs
+`provision.sh` + `bench.sh` and `PUT`s `$RES` into an R2 bucket the
+operator can read, or a small HTTP endpoint behind a 443 proxy. The
+harness is already shaped for that: every step is a separate script
+taking its inputs from the environment.
